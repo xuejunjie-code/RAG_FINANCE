@@ -1,45 +1,45 @@
 import os
 import torch
 import logging
-from typing import Tuple, List
-from paddleocr import PPStructure # 导入PP-Structure
-from langchain_chroma import Chroma
+from typing import List
+from paddleocr import PPStructure
+from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_core.vectorstores import DistanceStrategy # 导入距离策略
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class DocumentProcessor:
+class FAISSDocumentProcessor:
     """
-    使用本地部署的PaddleOCR/PP-Structure进行文档深度解析，
-    实现高质量的文表分离和结构化分块，并支持增量更新。
+    使用本地PaddleOCR/PP-Structure进行文档深度解析，
+    并为每个文档创建一个独立的、使用FAISS (IndexFlatIP) 存储的向量数据库。
     """
-    def __init__(self, data_path="dataset", vector_store_path="vec_store", model_name="BAAI/bge-large-zh-v1.5"):
+    def __init__(self, data_path="dataset", dbs_root_path="faiss_dbs", model_name="BAAI/bge-large-zh-v1.5"):
         self.data_path = data_path
-        self.vector_store_path = vector_store_path
-        self.processed_log_path = os.path.join(vector_store_path, "processed_files.log")
+        self.dbs_root_path = dbs_root_path # 存储所有FAISS数据库的根目录
+        self.processed_log_path = os.path.join(dbs_root_path, "processed_files.log")
         
-        # 初始化Embedding模型
+        # 确保数据库根目录存在
+        os.makedirs(self.dbs_root_path, exist_ok=True)
+        
+        # 初始化Embedding模型 (保持不变)
+        logging.info(f"正在加载Embedding模型: {model_name}")
         self.embedding_model = HuggingFaceEmbeddings(
             model_name=model_name,
             model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs={"normalize_embeddings": True}, # 归一化对于IP距离至关重要
         )
-        # 初始化向量数据库
-        self.vector_store = Chroma(
-            persist_directory=self.vector_store_path,
-            embedding_function=self.embedding_model
-        )
+        
         # 初始化备用的文本分割器
         self.recursive_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         
         # 初始化PP-Structure模型
         logging.info("正在初始化PP-Structure模型，首次运行可能需要下载模型文件...")
-        # layout=True 开启版面分析功能
         self.structure_engine = PPStructure(show_log=False, layout=True)
-        logging.info("DocumentProcessor 初始化完成 (PaddleOCR/PP-Structure 本地模式)。")
+        logging.info("FAISSDocumentProcessor 初始化完成。")
 
     def _get_processed_files(self) -> set:
         if not os.path.exists(self.processed_log_path): return set()
@@ -53,7 +53,7 @@ class DocumentProcessor:
     def _parse_with_ppstructure(self, file_path: str) -> List[Document]:
         """
         核心函数：使用本地的PP-Structure模型解析单个文档文件。
-        直接返回一个包含文本块和表格块的Document列表。
+        (此函数与之前版本基本相同)
         """
         logging.info(f"[PP-Structure] 正在解析文件: {os.path.basename(file_path)}")
         result = self.structure_engine(file_path)
@@ -65,7 +65,6 @@ class DocumentProcessor:
             if item_type == 'table':
                 table_html = item.get('res', {}).get('html', '')
                 if table_html:
-                    # 对于表格，直接创建一个独立的Document
                     table_caption = f"文件 {os.path.basename(file_path)} 中的表格"
                     table_content = f"### 表格：{table_caption}\n\n{table_html}"
                     table_doc = Document(
@@ -73,8 +72,7 @@ class DocumentProcessor:
                         metadata={"source": os.path.basename(file_path), "type": "table"}
                     )
                     doc_chunks.append(table_doc)
-            else: # 'text', 'title', 'list', 'figure' 等
-                # 对于文本，也将其创建为Document，后续再进行可能的合并与切分
+            else:
                 text_content = ""
                 text_lines = item.get('res', [])
                 for line_info in text_lines:
@@ -89,62 +87,64 @@ class DocumentProcessor:
                     
         return doc_chunks
 
-    def _load_and_process_new_documents(self) -> Tuple[List[Document], List[str]]:
+    def create_or_update_faiss_stores(self):
         """
-        使用PP-Structure加载和处理新文件。
+        主方法：扫描新文件，并为每个新文件创建独立的FAISS数据库。
         """
         processed_files = self._get_processed_files()
-        new_files_to_process_paths = []
-        files_to_process_names = []
-
         all_files_in_dir = [f for f in os.listdir(self.data_path) if f.endswith(('.pdf', '.png', '.jpg'))]
-        
+
+        new_files_count = 0
         for filename in all_files_in_dir:
-            if filename not in processed_files:
-                new_files_to_process_paths.append(os.path.join(self.data_path, filename))
-                files_to_process_names.append(filename)
+            if filename in processed_files:
+                continue
 
-        if not new_files_to_process_paths:
-            logging.info("没有发现新文件需要处理。")
-            return [], []
+            new_files_count += 1
+            file_path = os.path.join(self.data_path, filename)
+            logging.info(f"发现新文件: {filename}，开始处理...")
 
-        logging.info(f"发现 {len(new_files_to_process_paths)} 个新文件，开始使用PP-Structure进行本地解析...")
-        
-        all_new_chunks = []
-        for file_path in new_files_to_process_paths:
             try:
-                # 解析文档，直接得到分离好的文本块和表格块
+                # 1. 使用PP-Structure解析文档，得到初步的块
                 docs_from_file = self._parse_with_ppstructure(file_path)
                 
-                # 对解析出的文本块进行二次切分，以防单个文本区域过长
-                # 表格块则保持原样
-                temp_chunks = []
+                # 2. 对解析出的文本块进行二次切分
+                final_chunks = []
                 for doc in docs_from_file:
                     if doc.metadata.get("type") == "table":
-                        temp_chunks.append(doc)
+                        final_chunks.append(doc) # 表格块保持原样
                     else:
-                        # 使用递归字符分割器对文本块进行切分
                         split_text_docs = self.recursive_splitter.split_documents([doc])
-                        temp_chunks.extend(split_text_docs)
+                        final_chunks.extend(split_text_docs)
                 
-                all_new_chunks.extend(temp_chunks)
-                logging.info(f"成功解析并切分: {os.path.basename(file_path)}")
+                if not final_chunks:
+                    logging.warning(f"文件 {filename} 未解析出任何有效内容，跳过建库。")
+                    self._log_processed_file(filename) # 记录下来，避免重复处理
+                    continue
+
+                # 3. 创建FAISS数据库
+                logging.info(f"正在为 {filename} 创建FAISS索引...")
+                # 使用 from_documents 工厂方法，并指定距离策略为内积
+                # 对于归一化嵌入，内积等效于余弦相似度，FAISS会使用 IndexFlatIP
+                faiss_db = FAISS.from_documents(
+                    documents=final_chunks,
+                    embedding=self.embedding_model,
+                    distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT
+                )
+                
+                # 4. 定义并保存FAISS数据库到独立目录
+                db_name = os.path.splitext(filename)[0] # 使用文件名（不含扩展名）作为库名
+                db_path = os.path.join(self.dbs_root_path, db_name)
+                faiss_db.save_local(db_path)
+                
+                logging.info(f"成功为文件 {filename} 创建了独立的FAISS数据库，路径: {db_path}")
+                
+                # 5. 记录已处理的文件
+                self._log_processed_file(filename)
+
             except Exception as e:
-                logging.error(f"使用PP-Structure解析文件 {os.path.basename(file_path)} 失败: {e}")
-        
-        return all_new_chunks, files_to_process_names
+                logging.error(f"处理文件 {filename} 时发生严重错误: {e}", exc_info=True)
 
-    def update_vector_store(self):
-        """主方法：执行完整的文档处理和入库流程"""
-        new_chunks, processed_filenames = self._load_and_process_new_documents()
-        
-        if not new_chunks:
-            return
-
-        logging.info(f"开始将 {len(new_chunks)} 个新片段添加至向量数据库...")
-        self.vector_store.add_documents(documents=new_chunks)
-        
-        for filename in processed_filenames:
-            self._log_processed_file(filename)
-            
-        logging.info(f"向量数据库更新成功！新增了来自 {len(processed_filenames)} 个文件的 {len(new_chunks)} 个片段。")
+        if new_files_count == 0:
+            logging.info("没有发现新文件需要处理。")
+        else:
+            logging.info(f"处理完成！共为 {new_files_count} 个新文件创建了向量数据库。")

@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-from load_data import DocumentProcessor
+from load_data import FAISSDocumentProcessor
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -20,7 +20,7 @@ class RAG:
         print("--- Initializing RAG System ---")
         
         # 1. 初始化文档加载和向量存储
-        self.loader = DocumentProcessor()
+        self.loader = FAISSDocumentProcessor(data_path="dataset", dbs_root_path="faiss_dbs", model_name="BAAI/bge-large-zh-v1.5")
         self.loader.update_vector_store()
         self.vector_store = self.loader.vector_store
 
